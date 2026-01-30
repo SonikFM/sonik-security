@@ -1,0 +1,16 @@
+version: "3"
+services:
+  signoz:
+    image: ${REGISTRY_URL:-ghcr.io/sonikfm}/signoz:${SIGNOZ_VERSION:-v0.108.0}
+  
+  otel-collector:
+    image: ${REGISTRY_URL:-ghcr.io/sonikfm}/signoz-otel-collector:${OTEL_VERSION:-v0.129.12}
+
+  schema-migrator-sync:
+    image: ${REGISTRY_URL:-ghcr.io/sonikfm}/signoz-schema-migrator:${OTEL_VERSION:-v0.129.12}
+
+  schema-migrator-async:
+    image: ${REGISTRY_URL:-ghcr.io/sonikfm}/signoz-schema-migrator:${OTEL_VERSION:-v0.129.12}
+
+  zookeeper-1:
+    image: ${REGISTRY_URL:-ghcr.io/sonikfm}/zookeeper:3.7.1

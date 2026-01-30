@@ -1,0 +1,33 @@
+version: "3"
+services:
+  signoz:
+    ports:
+      - "127.0.0.1:8080:8080" # Bind to localhost only, Caddy proxies here
+    environment:
+      - TELEMETRY_ENABLED=false
+      - DEPLOYMENT_TYPE=docker-standalone-amd-airgapped
+      - SIGNOZ_TELEMETRY_ENABLED=false
+      - SIGNOZ_LLM_PROVIDER=openai
+      - SIGNOZ_LLM_MODEL=anthropic/claude-opus-4.5
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=https://openrouter.ai/api/v1
+      - SIGNOZ_AI_ENABLED=true
+
+  otel-collector:
+    ports:
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
+      - "127.0.0.1:13133:13133" # Health check
+    environment:
+      - LOW_CARDINAL_EXCEPTION_GROUPING=true
+
+  clickhouse:
+    # Use custom image with baked-in histogramQuantile
+    image: ${REGISTRY_URL:-ghcr.io/sonikfm}/signoz-clickhouse:25.5.6-histq1
+    volumes:
+      # Ensure data is on /data (which is where named volumes point if Docker root is moved)
+      # But explicit bind mounts are safer if we want to be sure.
+      # However, base uses named volumes.
+      # If we followed fix_host_storage_layout, /var/lib/docker is on /data.
+      # So named volumes are on /data.
+      - clickhouse:/var/lib/clickhouse/

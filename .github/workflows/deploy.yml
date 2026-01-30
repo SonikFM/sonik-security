@@ -1,0 +1,213 @@
+name: "Deploy: SigNoz (Echo6)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_deploy:
+        description: "Run deploy job (false = preflight only)"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      take_snapshot:
+        description: "Take EBS snapshot of /data in preflight (best-effort)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ECHO6_TAILSCALE_IP: 100.94.181.123
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          ping: ${{ env.ECHO6_TAILSCALE_IP }}
+
+      - name: Configure AWS Credentials (for snapshot)
+        if: ${{ github.event.inputs.take_snapshot == 'true' && env.AWS_ACCOUNT_ID != '' }}
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/digger-github-actions
+          aws-region: us-east-2
+
+      - name: Snapshot Echo6 data volume (preflight)
+        id: snapshot
+        if: ${{ github.event.inputs.take_snapshot == 'true' && env.AWS_ACCOUNT_ID != '' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          INSTANCE_ID="$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Role,Values=stateful" \
+              "Name=tag:Environment,Values=prod" \
+              "Name=instance-state-name,Values=running,stopped" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text)"
+
+          if [ -z "${INSTANCE_ID}" ]; then
+            echo "No EC2 instance found for Role=stateful Environment=prod"
+            exit 1
+          fi
+
+          VOLUME_ID="$(aws ec2 describe-volumes \
+            --filters \
+              "Name=attachment.instance-id,Values=${INSTANCE_ID}" \
+              "Name=attachment.device,Values=/dev/sdf" \
+            --query "Volumes[0].VolumeId" \
+            --output text)"
+
+          if [ -z "${VOLUME_ID}" ] || [ "${VOLUME_ID}" = "None" ]; then
+            echo "No data volume found on /dev/sdf for instance ${INSTANCE_ID}"
+            exit 1
+          fi
+
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          SNAPSHOT_ID="$(aws ec2 create-snapshot \
+            --volume-id "${VOLUME_ID}" \
+            --description "echo6 sonik-security preflight ${TS}" \
+            --tag-specifications "ResourceType=snapshot,Tags=[{Key=Project,Value=sonik},{Key=Env,Value=prod},{Key=Service,Value=sonik-security},{Key=CreatedBy,Value=github-actions},{Key=Timestamp,Value=${TS}}]" \
+            --query "SnapshotId" \
+            --output text)"
+
+          echo "Created snapshot: ${SNAPSHOT_ID} (volume ${VOLUME_ID})"
+          echo "snapshot_id=${SNAPSHOT_ID}" >> "$GITHUB_OUTPUT"
+          aws ec2 wait snapshot-completed --snapshot-ids "${SNAPSHOT_ID}"
+          echo "Snapshot completed: ${SNAPSHOT_ID}"
+
+      - name: Snapshot skipped/failed (non-blocking)
+        if: ${{ github.event.inputs.take_snapshot == 'false' || steps.snapshot.conclusion == 'failure' }}
+        run: |
+          if [ "${{ github.event.inputs.take_snapshot }}" != "true" ]; then
+            echo "Snapshot skipped (take_snapshot=false)."
+            exit 0
+          fi
+          echo "Snapshot step failed, continuing anyway (non-blocking)."
+
+      - name: Pre-flight cleanup
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.ECHO6_TAILSCALE_IP }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/ubuntu
+            # Stop existing if needed (careful not to stop PostHog)
+            # docker compose -f sonik-security/docker-compose.base.yml ... down || true
+            sudo rm -rf sonik-security
+            mkdir -p sonik-security
+
+      - name: Upload to host
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.ECHO6_TAILSCALE_IP }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.base.yml,docker-compose.override.yml,docker-compose.production-images.yml,*.xml,*.yaml,*.yml,dashboards/**,images/**"
+          target: "~/sonik-security"
+          overwrite: true
+          rm: false
+
+      - name: Preflight Check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.ECHO6_TAILSCALE_IP }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            echo "=== Preflight: SigNoz ===" 
+            docker --version && docker compose version
+            echo "=== Disk ===" && df -h /data | tail -1
+            echo "=== GHCR ===" 
+            docker pull ghcr.io/sonikfm/signoz:v0.108.0 --quiet 2>/dev/null && echo "OK" || echo "Need login"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: ${{ github.ref_name == 'main' && github.event.inputs.run_deploy == 'true' }}
+    environment: production
+    concurrency:
+      group: echo6-signoz
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          ping: ${{ env.ECHO6_TAILSCALE_IP }}
+
+      - name: Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.ECHO6_TAILSCALE_IP }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            cd ~/sonik-security
+            
+            # Create .env
+            cat > .env << 'EOF'
+            REGISTRY_URL=ghcr.io/sonikfm
+            SIGNOZ_VERSION=v0.108.0
+            OTEL_VERSION=v0.129.12
+            TELEMETRY_ENABLED=false
+            DEPLOYMENT_TYPE=docker-standalone-amd-airgapped
+            SIGNOZ_TELEMETRY_ENABLED=false
+            SIGNOZ_LLM_PROVIDER=openai
+            SIGNOZ_LLM_MODEL=anthropic/claude-opus-4.5
+            OPENAI_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+            OPENAI_API_BASE=https://openrouter.ai/api/v1
+            SIGNOZ_AI_ENABLED=true
+            LOW_CARDINAL_EXCEPTION_GROUPING=true
+            EOF
+            
+            # GHCR login
+            echo "${{ secrets.GH_PAT }}" | docker login ghcr.io -u sonikfm --password-stdin
+            
+            # Pull and deploy
+            docker compose -f docker-compose.base.yml -f docker-compose.override.yml -f docker-compose.production-images.yml pull
+            docker compose -f docker-compose.base.yml -f docker-compose.override.yml -f docker-compose.production-images.yml up -d --remove-orphans
+            docker compose -f docker-compose.base.yml -f docker-compose.override.yml -f docker-compose.production-images.yml ps
+
+      - name: Health Check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ env.ECHO6_TAILSCALE_IP }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/sonik-security
+            for i in $(seq 1 60); do
+              curl -fsS --max-time 5 http://localhost:8080/api/v1/health >/dev/null 2>&1 && echo "✓ Healthy" && exit 0
+              echo "Waiting... ($i/60)" && sleep 2
+            done
+            echo "✗ Failed" && docker compose -f docker-compose.base.yml -f docker-compose.override.yml -f docker-compose.production-images.yml logs --tail=100 signoz && exit 1

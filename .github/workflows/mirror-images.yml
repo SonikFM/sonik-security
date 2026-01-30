@@ -1,0 +1,83 @@
+name: Mirror + Build SigNoz Images (GHCR)
+
+on:
+  workflow_dispatch:
+    inputs:
+      signoz_version:
+        description: "SigNoz version tag (default: v0.108.0)"
+        default: "v0.108.0"
+      otel_version:
+        description: "OTEL Collector version tag (default: v0.129.12)"
+        default: "v0.129.12"
+      platform:
+        description: "Target platform"
+        default: "linux/arm64"
+        type: choice
+        options:
+          - "linux/arm64"
+          - "linux/amd64"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: sonikfm
+
+jobs:
+  build-and-mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_PAT }}
+
+      - name: Build custom ClickHouse image (with histogramQuantile)
+        env:
+          PLATFORM: ${{ inputs.platform || 'linux/arm64' }}
+        run: |
+          set -euo pipefail
+          TAG="25.5.6-histq1"
+          
+          echo "Building ghcr.io/${OWNER}/signoz-clickhouse:${TAG} for ${PLATFORM}"
+          docker buildx build \
+            --platform "${PLATFORM}" \
+            -f images/clickhouse/Dockerfile \
+            -t "${REGISTRY}/${OWNER}/signoz-clickhouse:${TAG}" \
+            --push \
+            .
+
+      - name: Mirror SigNoz images
+        env:
+          SIGNOZ_TAG: ${{ inputs.signoz_version || 'v0.108.0' }}
+          OTEL_TAG: ${{ inputs.otel_version || 'v0.129.12' }}
+          PLATFORM: ${{ inputs.platform || 'linux/arm64' }}
+        run: |
+          set -euo pipefail
+          
+          mirror() {
+            local src="$1"
+            local dest="$2"
+            echo "Pull ${src} (${PLATFORM})"
+            docker pull --platform "${PLATFORM}" "${src}"
+            docker tag "${src}" "${REGISTRY}/${OWNER}/${dest}"
+            docker push "${REGISTRY}/${OWNER}/${dest}"
+          }
+
+          mirror "signoz/signoz:${SIGNOZ_TAG}" "signoz:${SIGNOZ_TAG}"
+          mirror "signoz/signoz-otel-collector:${OTEL_TAG}" "signoz-otel-collector:${OTEL_TAG}"
+          mirror "signoz/signoz-schema-migrator:${OTEL_TAG}" "signoz-schema-migrator:${OTEL_TAG}"
+          mirror "signoz/zookeeper:3.7.1" "zookeeper:3.7.1"
